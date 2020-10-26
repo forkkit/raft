@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"container/list"
 	"fmt"
-	"github.com/hashicorp/go-hclog"
 	"io"
 	"io/ioutil"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/armon/go-metrics"
 )
@@ -95,7 +96,7 @@ func (r *Raft) setLeader(leader ServerAddress) {
 	r.leader = leader
 	r.leaderLock.Unlock()
 	if oldLeader != leader {
-		r.observe(LeaderObservation{leader: leader})
+		r.observe(LeaderObservation{Leader: leader})
 	}
 }
 
@@ -310,6 +311,10 @@ func (r *Raft) runCandidate() {
 			// Reject any restores since we are not the leader
 			r.respond(ErrNotLeader)
 
+		case r := <-r.leadershipTransferCh:
+			// Reject any operations since we are not the leader
+			r.respond(ErrNotLeader)
+
 		case c := <-r.configurationsCh:
 			c.configurations = r.configurations.Clone()
 			c.respond(nil)
@@ -363,7 +368,7 @@ func (r *Raft) runLeader() {
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
 
 	// Notify that we are the leader
-	asyncNotifyBool(r.leaderCh, true)
+	overrideNotifyBool(r.leaderCh, true)
 
 	// Push to the notify channel if given
 	if notify := r.conf.NotifyCh; notify != nil {
@@ -419,7 +424,7 @@ func (r *Raft) runLeader() {
 		r.leaderLock.Unlock()
 
 		// Notify that we are not the leader
-		asyncNotifyBool(r.leaderCh, false)
+		overrideNotifyBool(r.leaderCh, false)
 
 		// Push to the notify channel if given
 		if notify := r.conf.NotifyCh; notify != nil {
@@ -468,10 +473,13 @@ func (r *Raft) startStopReplication() {
 		if server.ID == r.localID {
 			continue
 		}
+
 		inConfig[server.ID] = true
-		if _, ok := r.leaderState.replState[server.ID]; !ok {
+
+		s, ok := r.leaderState.replState[server.ID]
+		if !ok {
 			r.logger.Info("added peer, starting replication", "peer", server.ID)
-			s := &followerReplication{
+			s = &followerReplication{
 				peer:                server,
 				commitment:          r.leaderState.commitment,
 				stopCh:              make(chan uint64, 1),
@@ -484,10 +492,14 @@ func (r *Raft) startStopReplication() {
 				notifyCh:            make(chan struct{}, 1),
 				stepDown:            r.leaderState.stepDown,
 			}
+
 			r.leaderState.replState[server.ID] = s
 			r.goFunc(func() { r.replicate(s) })
 			asyncNotifyCh(s.triggerCh)
 			r.observe(PeerObservation{Peer: server, Removed: false})
+		} else if ok && s.peer.Address != server.Address {
+			r.logger.Info("updating peer", "peer", server.ID)
+			s.peer = server
 		}
 	}
 
@@ -503,6 +515,9 @@ func (r *Raft) startStopReplication() {
 		delete(r.leaderState.replState, serverID)
 		r.observe(PeerObservation{Peer: repl.peer, Removed: true})
 	}
+
+	// Update peers metric
+	metrics.SetGauge([]string{"raft", "peers"}, float32(len(r.configurations.latest.Servers)))
 }
 
 // configurationChangeChIfStable returns r.configurationChangeCh if it's safe
@@ -618,42 +633,51 @@ func (r *Raft) leaderLoop() {
 			commitIndex := r.leaderState.commitment.getCommitIndex()
 			r.setCommitIndex(commitIndex)
 
+			// New configration has been committed, set it as the committed
+			// value.
 			if r.configurations.latestIndex > oldCommitIndex &&
 				r.configurations.latestIndex <= commitIndex {
-				r.configurations.committed = r.configurations.latest
-				r.configurations.committedIndex = r.configurations.latestIndex
+				r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
 				if !hasVote(r.configurations.committed, r.localID) {
 					stepDown = true
 				}
 			}
 
-			var numProcessed int
 			start := time.Now()
+			var groupReady []*list.Element
+			var groupFutures = make(map[uint64]*logFuture)
+			var lastIdxInGroup uint64
 
-			for {
-				e := r.leaderState.inflight.Front()
-				if e == nil {
-					break
-				}
+			// Pull all inflight logs that are committed off the queue.
+			for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
 				commitLog := e.Value.(*logFuture)
 				idx := commitLog.log.Index
 				if idx > commitIndex {
+					// Don't go past the committed index
 					break
 				}
+
 				// Measure the commit time
 				metrics.MeasureSince([]string{"raft", "commitTime"}, commitLog.dispatch)
+				groupReady = append(groupReady, e)
+				groupFutures[idx] = commitLog
+				lastIdxInGroup = idx
+			}
 
-				r.processLogs(idx, commitLog)
+			// Process the group
+			if len(groupReady) != 0 {
+				r.processLogs(lastIdxInGroup, groupFutures)
 
-				r.leaderState.inflight.Remove(e)
-				numProcessed++
+				for _, e := range groupReady {
+					r.leaderState.inflight.Remove(e)
+				}
 			}
 
 			// Measure the time to enqueue batch of logs for FSM to apply
 			metrics.MeasureSince([]string{"raft", "fsm", "enqueue"}, start)
 
 			// Count the number of logs enqueued
-			metrics.SetGauge([]string{"raft", "commitNumLogs"}, float32(numProcessed))
+			metrics.SetGauge([]string{"raft", "commitNumLogs"}, float32(len(groupReady)))
 
 			if stepDown {
 				if r.conf.ShutdownOnRemove {
@@ -972,6 +996,7 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 	// Restore the snapshot into the FSM. If this fails we are in a
 	// bad state so we panic to take ourselves out.
 	fsm := &restoreFuture{ID: sink.ID()}
+	fsm.ShutdownCh = r.shutdownCh
 	fsm.init()
 	select {
 	case r.fsmMutateCh <- fsm:
@@ -1026,14 +1051,13 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 	} else {
 		future.log = Log{
 			Type: LogConfiguration,
-			Data: encodeConfiguration(configuration),
+			Data: EncodeConfiguration(configuration),
 		}
 	}
 
 	r.dispatchLogs([]*logFuture{&future.logFuture})
 	index := future.Index()
-	r.configurations.latest = configuration
-	r.configurations.latestIndex = index
+	r.setLatestConfiguration(configuration, index)
 	r.leaderState.commitment.setConfiguration(configuration)
 	r.startStopReplication()
 }
@@ -1084,10 +1108,10 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 // applied up to the given index limit.
 // This can be called from both leaders and followers.
 // Followers call this from AppendEntries, for n entries at a time, and always
-// pass future=nil.
-// Leaders call this once per inflight when entries are committed. They pass
-// the future from inflights.
-func (r *Raft) processLogs(index uint64, future *logFuture) {
+// pass futures=nil.
+// Leaders call this when entries are committed. They pass the futures from any
+// inflight logs.
+func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	// Reject logs we've applied already
 	lastApplied := r.getLastApplied()
 	if index <= lastApplied {
@@ -1095,61 +1119,77 @@ func (r *Raft) processLogs(index uint64, future *logFuture) {
 		return
 	}
 
+	applyBatch := func(batch []*commitTuple) {
+		select {
+		case r.fsmMutateCh <- batch:
+		case <-r.shutdownCh:
+			for _, cl := range batch {
+				if cl.future != nil {
+					cl.future.respond(ErrRaftShutdown)
+				}
+			}
+		}
+	}
+
+	batch := make([]*commitTuple, 0, r.conf.MaxAppendEntries)
+
 	// Apply all the preceding logs
-	for idx := r.getLastApplied() + 1; idx <= index; idx++ {
+	for idx := lastApplied + 1; idx <= index; idx++ {
+		var preparedLog *commitTuple
 		// Get the log, either from the future or from our log store
-		if future != nil && future.log.Index == idx {
-			r.processLog(&future.log, future)
+		future, futureOk := futures[idx]
+		if futureOk {
+			preparedLog = r.prepareLog(&future.log, future)
 		} else {
 			l := new(Log)
 			if err := r.logs.GetLog(idx, l); err != nil {
 				r.logger.Error("failed to get log", "index", idx, "error", err)
 				panic(err)
 			}
-			r.processLog(l, nil)
+			preparedLog = r.prepareLog(l, nil)
 		}
 
-		// Update the lastApplied index and term
-		r.setLastApplied(idx)
+		switch {
+		case preparedLog != nil:
+			// If we have a log ready to send to the FSM add it to the batch.
+			// The FSM thread will respond to the future.
+			batch = append(batch, preparedLog)
+
+			// If we have filled up a batch, send it to the FSM
+			if len(batch) >= r.conf.MaxAppendEntries {
+				applyBatch(batch)
+				batch = make([]*commitTuple, 0, r.conf.MaxAppendEntries)
+			}
+
+		case futureOk:
+			// Invoke the future if given.
+			future.respond(nil)
+		}
 	}
+
+	// If there are any remaining logs in the batch apply them
+	if len(batch) != 0 {
+		applyBatch(batch)
+	}
+
+	// Update the lastApplied index and term
+	r.setLastApplied(index)
 }
 
 // processLog is invoked to process the application of a single committed log entry.
-func (r *Raft) processLog(l *Log, future *logFuture) {
+func (r *Raft) prepareLog(l *Log, future *logFuture) *commitTuple {
 	switch l.Type {
 	case LogBarrier:
 		// Barrier is handled by the FSM
 		fallthrough
 
 	case LogCommand:
-		// Forward to the fsm handler
-		select {
-		case r.fsmMutateCh <- &commitTuple{l, future}:
-		case <-r.shutdownCh:
-			if future != nil {
-				future.respond(ErrRaftShutdown)
-			}
-		}
-
-		// Return so that the future is only responded to
-		// by the FSM handler when the application is done
-		return
+		return &commitTuple{l, future}
 
 	case LogConfiguration:
 		// Only support this with the v2 configuration format
 		if r.protocolVersion > 2 {
-			// Forward to the fsm handler
-			select {
-			case r.fsmMutateCh <- &commitTuple{l, future}:
-			case <-r.shutdownCh:
-				if future != nil {
-					future.respond(ErrRaftShutdown)
-				}
-			}
-
-			// Return so that the future is only responded to
-			// by the FSM handler when the application is done
-			return
+			return &commitTuple{l, future}
 		}
 	case LogAddPeerDeprecated:
 	case LogRemovePeerDeprecated:
@@ -1160,10 +1200,7 @@ func (r *Raft) processLog(l *Log, future *logFuture) {
 		panic(fmt.Errorf("unrecognized log type: %#v", l))
 	}
 
-	// Invoke the future if given
-	if future != nil {
-		future.respond(nil)
-	}
+	return nil
 }
 
 // processRPC is called to handle an incoming RPC request. This must only be
@@ -1305,8 +1342,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 					return
 				}
 				if entry.Index <= r.configurations.latestIndex {
-					r.configurations.latest = r.configurations.committed
-					r.configurations.latestIndex = r.configurations.committedIndex
+					r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
 				}
 				newEntries = a.Entries[i:]
 				break
@@ -1341,8 +1377,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		idx := min(a.LeaderCommitIndex, r.getLastIndex())
 		r.setCommitIndex(idx)
 		if r.configurations.latestIndex <= idx {
-			r.configurations.committed = r.configurations.latest
-			r.configurations.committedIndex = r.configurations.latestIndex
+			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
 		}
 		r.processLogs(idx, nil)
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
@@ -1359,15 +1394,11 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 // called from the main thread, or from NewRaft() before any threads have begun.
 func (r *Raft) processConfigurationLogEntry(entry *Log) {
 	if entry.Type == LogConfiguration {
-		r.configurations.committed = r.configurations.latest
-		r.configurations.committedIndex = r.configurations.latestIndex
-		r.configurations.latest = decodeConfiguration(entry.Data)
-		r.configurations.latestIndex = entry.Index
+		r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+		r.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)
 	} else if entry.Type == LogAddPeerDeprecated || entry.Type == LogRemovePeerDeprecated {
-		r.configurations.committed = r.configurations.latest
-		r.configurations.committedIndex = r.configurations.latestIndex
-		r.configurations.latest = decodePeers(entry.Data, r.trans)
-		r.configurations.latestIndex = entry.Index
+		r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+		r.setLatestConfiguration(decodePeers(entry.Data, r.trans), entry.Index)
 	}
 }
 
@@ -1435,7 +1466,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	if lastVoteTerm == req.Term && lastVoteCandBytes != nil {
 		r.logger.Info("duplicate requestVote for same term", "term", req.Term)
 		if bytes.Compare(lastVoteCandBytes, req.Candidate) == 0 {
-			r.logger.Warn("duplicate requestVote from", "candidate", req.Candidate)
+			r.logger.Warn("duplicate requestVote from", "candidate", candidate)
 			resp.Granted = true
 		}
 		return
@@ -1517,7 +1548,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	var reqConfiguration Configuration
 	var reqConfigurationIndex uint64
 	if req.SnapshotVersion > 0 {
-		reqConfiguration = decodeConfiguration(req.Configuration)
+		reqConfiguration = DecodeConfiguration(req.Configuration)
 		reqConfigurationIndex = req.ConfigurationIndex
 	} else {
 		reqConfiguration = decodePeers(req.Peers, r.trans)
@@ -1560,6 +1591,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 
 	// Restore snapshot
 	future := &restoreFuture{ID: sink.ID()}
+	future.ShutdownCh = r.shutdownCh
 	future.init()
 	select {
 	case r.fsmMutateCh <- future:
@@ -1582,10 +1614,8 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	r.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)
 
 	// Restore the peer set
-	r.configurations.latest = reqConfiguration
-	r.configurations.latestIndex = reqConfigurationIndex
-	r.configurations.committed = reqConfiguration
-	r.configurations.committedIndex = reqConfigurationIndex
+	r.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)
+	r.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)
 
 	// Compact logs, continue even if this fails
 	if err := r.compactLogs(req.LastLogIndex); err != nil {
@@ -1718,13 +1748,13 @@ func (r *Raft) lookupServer(id ServerID) *Server {
 	return nil
 }
 
-// pickServer returns the follower that is most up to date. Because it accesses
-// leaderstate, it should only be called from the leaderloop.
+// pickServer returns the follower that is most up to date and participating in quorum.
+// Because it accesses leaderstate, it should only be called from the leaderloop.
 func (r *Raft) pickServer() *Server {
 	var pick *Server
 	var current uint64
 	for _, server := range r.configurations.latest.Servers {
-		if server.ID == r.localID {
+		if server.ID == r.localID || server.Suffrage != Voter {
 			continue
 		}
 		state, ok := r.leaderState.replState[server.ID]
@@ -1771,4 +1801,31 @@ func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	r.setState(Candidate)
 	r.candidateFromLeadershipTransfer = true
 	rpc.Respond(&TimeoutNowResponse{}, nil)
+}
+
+// setLatestConfiguration stores the latest configuration and updates a copy of it.
+func (r *Raft) setLatestConfiguration(c Configuration, i uint64) {
+	r.configurations.latest = c
+	r.configurations.latestIndex = i
+	r.latestConfiguration.Store(c.Clone())
+}
+
+// setCommittedConfiguration stores the committed configuration.
+func (r *Raft) setCommittedConfiguration(c Configuration, i uint64) {
+	r.configurations.committed = c
+	r.configurations.committedIndex = i
+}
+
+// getLatestConfiguration reads the configuration from a copy of the main
+// configuration, which means it can be accessed independently from the main
+// loop.
+func (r *Raft) getLatestConfiguration() Configuration {
+	// this switch catches the case where this is called without having set
+	// a configuration previously.
+	switch c := r.latestConfiguration.Load().(type) {
+	case Configuration:
+		return c
+	default:
+		return Configuration{}
+	}
 }

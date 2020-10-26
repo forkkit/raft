@@ -146,6 +146,7 @@ func (r *Raft) takeSnapshot() (string, error) {
 	// We have to use the future here to safely get this information since
 	// it is owned by the main thread.
 	configReq := &configurationsFuture{}
+	configReq.ShutdownCh = r.shutdownCh
 	configReq.init()
 	select {
 	case r.configurationsCh <- configReq:
@@ -227,6 +228,11 @@ func (r *Raft) compactLogs(snapIdx uint64) error {
 	// at least `TrailingLogs` entries, but does not allow logs
 	// after the snapshot to be removed.
 	maxLog := min(snapIdx, lastLogIdx-r.conf.TrailingLogs)
+
+	if minLog > maxLog {
+		r.logger.Info("no logs to truncate")
+		return nil
+	}
 
 	r.logger.Info("compacting logs", "from", minLog, "to", maxLog)
 

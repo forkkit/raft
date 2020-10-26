@@ -102,7 +102,7 @@ func TestRaft_RecoverCluster_NoState(t *testing.T) {
 	r := c.rafts[0]
 	configuration := Configuration{
 		Servers: []Server{
-			Server{
+			{
 				ID:      r.localID,
 				Address: r.localAddr,
 			},
@@ -119,6 +119,7 @@ func TestRaft_RecoverCluster(t *testing.T) {
 	// Run with different number of applies which will cover no snapshot and
 	// snapshot + log scenarios. By sweeping through the trailing logs value
 	// we will also hit the case where we have a snapshot only.
+	var err error
 	runRecover := func(applies int) {
 		conf := inmemConfig(t)
 		conf.TrailingLogs = 10
@@ -130,50 +131,54 @@ func TestRaft_RecoverCluster(t *testing.T) {
 		leader := c.Leader()
 		for i := 0; i < applies; i++ {
 			future := leader.Apply([]byte(fmt.Sprintf("test%d", i)), 0)
-			if err := future.Error(); err != nil {
-				c.FailNowf("apply err: %v", err)
+			if err = future.Error(); err != nil {
+				c.FailNowf("[ERR] apply err: %v", err)
 			}
 		}
 
 		// Snap the configuration.
 		future := leader.GetConfiguration()
-		if err := future.Error(); err != nil {
-			c.FailNowf("get configuration err: %v", err)
+		if err = future.Error(); err != nil {
+			c.FailNowf("[ERR] get configuration err: %v", err)
 		}
 		configuration := future.Configuration()
 
 		// Shut down the cluster.
 		for _, sec := range c.rafts {
-			if err := sec.Shutdown().Error(); err != nil {
-				c.FailNowf("shutdown err: %v", err)
+			if err = sec.Shutdown().Error(); err != nil {
+				c.FailNowf("[ERR] shutdown err: %v", err)
 			}
 		}
 
 		// Recover the cluster. We need to replace the transport and we
 		// replace the FSM so no state can carry over.
 		for i, r := range c.rafts {
-			before, err := r.snapshots.List()
+			var before []*SnapshotMeta
+			before, err = r.snapshots.List()
 			if err != nil {
 				c.FailNowf("snapshot list err: %v", err)
 			}
-			if err := RecoverCluster(&r.conf, &MockFSM{}, r.logs, r.stable,
+			if err = RecoverCluster(&r.conf, &MockFSM{}, r.logs, r.stable,
 				r.snapshots, r.trans, configuration); err != nil {
 				c.FailNowf("recover err: %v", err)
 			}
 
 			// Make sure the recovery looks right.
-			after, err := r.snapshots.List()
+			var after []*SnapshotMeta
+			after, err = r.snapshots.List()
 			if err != nil {
 				c.FailNowf("snapshot list err: %v", err)
 			}
 			if len(after) != len(before)+1 {
 				c.FailNowf("expected a new snapshot, %d vs. %d", len(before), len(after))
 			}
-			first, err := r.logs.FirstIndex()
+			var first uint64
+			first, err = r.logs.FirstIndex()
 			if err != nil {
 				c.FailNowf("first log index err: %v", err)
 			}
-			last, err := r.logs.LastIndex()
+			var last uint64
+			last, err = r.logs.LastIndex()
 			if err != nil {
 				c.FailNowf("last log index err: %v", err)
 			}
@@ -185,7 +190,8 @@ func TestRaft_RecoverCluster(t *testing.T) {
 			// up the cluster state manually since this is an unusual
 			// operation.
 			_, trans := NewInmemTransport(r.localAddr)
-			r2, err := NewRaft(&r.conf, &MockFSM{}, r.logs, r.stable, r.snapshots, trans)
+			var r2 *Raft
+			r2, err = NewRaft(&r.conf, &MockFSM{}, r.logs, r.stable, r.snapshots, trans)
 			if err != nil {
 				c.FailNowf("new raft err: %v", err)
 			}
@@ -202,11 +208,14 @@ func TestRaft_RecoverCluster(t *testing.T) {
 		c.EnsureSamePeers(t)
 	}
 	for applies := 0; applies < 20; applies++ {
-		runRecover(applies)
+		t.Run(fmt.Sprintf("%d applies", applies), func(t *testing.T) {
+			runRecover(applies)
+		})
 	}
 }
 
 func TestRaft_HasExistingState(t *testing.T) {
+	var err error
 	// Make a cluster.
 	c := MakeCluster(2, t, nil)
 	defer c.Close()
@@ -215,7 +224,8 @@ func TestRaft_HasExistingState(t *testing.T) {
 	c1 := MakeClusterNoBootstrap(1, t, nil)
 
 	// Make sure the initial state is clean.
-	hasState, err := HasExistingState(c1.rafts[0].logs, c1.rafts[0].stable, c1.rafts[0].snapshots)
+	var hasState bool
+	hasState, err = HasExistingState(c1.rafts[0].logs, c1.rafts[0].stable, c1.rafts[0].snapshots)
 	if err != nil || hasState {
 		c.FailNowf("should not have any existing state, %v", err)
 	}
@@ -226,8 +236,8 @@ func TestRaft_HasExistingState(t *testing.T) {
 
 	// Join the new node in.
 	future := c.Leader().AddVoter(c1.rafts[0].localID, c1.rafts[0].localAddr, 0, 0)
-	if err := future.Error(); err != nil {
-		c.FailNowf("err: %v", err)
+	if err = future.Error(); err != nil {
+		c.FailNowf("[ERR] err: %v", err)
 	}
 
 	// Check the FSMs.
@@ -1014,6 +1024,7 @@ func TestRaft_NoRestoreOnStart(t *testing.T) {
 }
 
 func TestRaft_SnapshotRestore_PeerChange(t *testing.T) {
+	var err error
 	// Make the cluster.
 	conf := inmemConfig(t)
 	conf.ProtocolVersion = 1
@@ -1029,20 +1040,20 @@ func TestRaft_SnapshotRestore_PeerChange(t *testing.T) {
 	}
 
 	// Wait for the last future to apply
-	if err := future.Error(); err != nil {
-		c.FailNowf("err: %v", err)
+	if err = future.Error(); err != nil {
+		c.FailNowf("[ERR] err: %v", err)
 	}
 
 	// Take a snapshot.
 	snapFuture := leader.Snapshot()
-	if err := snapFuture.Error(); err != nil {
-		c.FailNowf("err: %v", err)
+	if err = snapFuture.Error(); err != nil {
+		c.FailNowf("[ERR] err: %v", err)
 	}
 
 	// Shutdown.
 	shutdown := leader.Shutdown()
-	if err := shutdown.Error(); err != nil {
-		c.FailNowf("err: %v", err)
+	if err = shutdown.Error(); err != nil {
+		c.FailNowf("[ERR] err: %v", err)
 	}
 
 	// Make a separate cluster.
@@ -1052,8 +1063,8 @@ func TestRaft_SnapshotRestore_PeerChange(t *testing.T) {
 	// Kill the old cluster.
 	for _, sec := range c.rafts {
 		if sec != leader {
-			if err := sec.Shutdown().Error(); err != nil {
-				c.FailNowf("shutdown err: %v", err)
+			if err = sec.Shutdown().Error(); err != nil {
+				c.FailNowf("[ERR] shutdown err: %v", err)
 			}
 		}
 	}
@@ -1076,14 +1087,14 @@ func TestRaft_SnapshotRestore_PeerChange(t *testing.T) {
 	}
 	defer os.RemoveAll(base)
 	peersFile := filepath.Join(base, "peers.json")
-	if err := ioutil.WriteFile(peersFile, content, 0666); err != nil {
-		c.FailNowf("err: %v", err)
+	if err = ioutil.WriteFile(peersFile, content, 0666); err != nil {
+		c.FailNowf("[ERR] err: %v", err)
 	}
 	configuration, err := ReadPeersJSON(peersFile)
 	if err != nil {
 		c.FailNowf("err: %v", err)
 	}
-	if err := RecoverCluster(&r.conf, &MockFSM{}, r.logs, r.stable,
+	if err = RecoverCluster(&r.conf, &MockFSM{}, r.logs, r.stable,
 		r.snapshots, r.trans, configuration); err != nil {
 		c.FailNowf("err: %v", err)
 	}
@@ -1157,8 +1168,10 @@ func TestRaft_UserSnapshot(t *testing.T) {
 
 	// With nothing committed, asking for a snapshot should return an error.
 	leader := c.Leader()
-	if err := leader.Snapshot().Error(); err != ErrNothingNewToSnapshot {
-		c.FailNowf("Request for Snapshot failed: %v", err)
+	if userSnapshotErrorsOnNoData {
+		if err := leader.Snapshot().Error(); err != ErrNothingNewToSnapshot {
+			c.FailNowf("Request for Snapshot failed: %v", err)
+		}
 	}
 
 	// Commit some things.
@@ -1186,6 +1199,13 @@ func TestRaft_UserSnapshot(t *testing.T) {
 func snapshotAndRestore(t *testing.T, offset uint64) {
 	// Make the cluster.
 	conf := inmemConfig(t)
+
+	// snapshot operations perform some file IO operations.
+	// increase times out to account for that
+	conf.HeartbeatTimeout = 500 * time.Millisecond
+	conf.ElectionTimeout = 500 * time.Millisecond
+	conf.LeaderLeaseTimeout = 500 * time.Millisecond
+
 	c := MakeCluster(3, t, conf)
 	defer c.Close()
 
@@ -1269,15 +1289,22 @@ func snapshotAndRestore(t *testing.T, offset uint64) {
 }
 
 func TestRaft_UserRestore(t *testing.T) {
-	// Snapshots from the past.
-	snapshotAndRestore(t, 0)
-	snapshotAndRestore(t, 1)
-	snapshotAndRestore(t, 2)
+	cases := []uint64{
+		0,
+		1,
+		2,
 
-	// Snapshots from the future.
-	snapshotAndRestore(t, 100)
-	snapshotAndRestore(t, 1000)
-	snapshotAndRestore(t, 10000)
+		// Snapshots from the future
+		100,
+		1000,
+		10000,
+	}
+
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("case %v", c), func(t *testing.T) {
+			snapshotAndRestore(t, c)
+		})
+	}
 }
 
 func TestRaft_SendSnapshotFollower(t *testing.T) {
@@ -1479,13 +1506,17 @@ func TestRaft_LeaderLeaseExpire(t *testing.T) {
 	c.Disconnect(follower.localAddr)
 
 	// Watch the leaderCh
-	select {
-	case v := <-leader.LeaderCh():
-		if v {
-			c.FailNowf("should step down as leader")
+	timeout := time.After(conf.LeaderLeaseTimeout * 2)
+LOOP:
+	for {
+		select {
+		case v := <-leader.LeaderCh():
+			if !v {
+				break LOOP
+			}
+		case <-timeout:
+			c.FailNowf("timeout stepping down as leader")
 		}
-	case <-time.After(conf.LeaderLeaseTimeout * 2):
-		c.FailNowf("timeout stepping down as leader")
 	}
 
 	// Ensure the last contact of the leader is non-zero
@@ -1540,7 +1571,7 @@ func TestRaft_Barrier(t *testing.T) {
 	// Ensure all the logs are the same
 	c.EnsureSame(t)
 	if len(getMockFSM(c.fsms[0]).logs) != 100 {
-		c.FailNowf("Bad log length")
+		c.FailNowf(fmt.Sprintf("Bad log length: %d", len(getMockFSM(c.fsms[0]).logs)))
 	}
 }
 
@@ -1639,51 +1670,6 @@ func TestRaft_VerifyLeader_PartialConnect(t *testing.T) {
 	// Wait for the leader to step down
 	if err := verify.Error(); err != nil {
 		c.FailNowf("err: %v", err)
-	}
-}
-
-func TestRaft_StartAsLeader(t *testing.T) {
-	conf := inmemConfig(t)
-	conf.StartAsLeader = true
-	c := MakeCluster(1, t, conf)
-	defer c.Close()
-	raft := c.rafts[0]
-
-	// Watch leaderCh for change
-	select {
-	case v := <-raft.LeaderCh():
-		if !v {
-			c.FailNowf("should become leader")
-		}
-	case <-time.After(c.conf.HeartbeatTimeout * 4):
-		// Longer than you think as possibility of multiple elections
-		c.FailNowf("timeout becoming leader")
-	}
-
-	// Should be leader
-	if s := raft.State(); s != Leader {
-		c.FailNowf("expected leader: %v", s)
-	}
-
-	// Should be able to apply
-	future := raft.Apply([]byte("test"), c.conf.CommitTimeout)
-	if err := future.Error(); err != nil {
-		c.FailNowf("err: %v", err)
-	}
-
-	// Check the response
-	if future.Response().(int) != 1 {
-		c.FailNowf("bad response: %v", future.Response())
-	}
-
-	// Check the index
-	if idx := future.Index(); idx == 0 {
-		c.FailNowf("bad index: %d", idx)
-	}
-
-	// Check that it is applied to the FSM
-	if len(getMockFSM(c.fsms[0]).logs) != 1 {
-		c.FailNowf("did not apply to FSM!")
 	}
 }
 
@@ -1980,7 +1966,7 @@ func TestRaft_LeadershipTransferToInvalidID(t *testing.T) {
 	c := MakeCluster(3, t, nil)
 	defer c.Close()
 
-	future := c.Leader().LeadershipTransferToServer(ServerID("abc"), ServerAddress("127.0.0.1"))
+	future := c.Leader().LeadershipTransferToServer(ServerID("abc"), ServerAddress("localhost"))
 	if future.Error() == nil {
 		t.Fatal("leadership transfer should err")
 	}
@@ -1997,7 +1983,7 @@ func TestRaft_LeadershipTransferToInvalidAddress(t *testing.T) {
 	defer c.Close()
 
 	follower := c.GetInState(Follower)[0]
-	future := c.Leader().LeadershipTransferToServer(follower.localID, ServerAddress("127.0.0.1"))
+	future := c.Leader().LeadershipTransferToServer(follower.localID, ServerAddress("localhost"))
 	if future.Error() == nil {
 		t.Fatal("leadership transfer should err")
 	}
@@ -2061,7 +2047,6 @@ func TestRaft_LeadershipTransferLeaderRejectsClientRequests(t *testing.T) {
 		l.Apply([]byte("test"), 0),
 		l.Barrier(0),
 		l.DemoteVoter(ServerID(""), 0, 0),
-		l.GetConfiguration(),
 
 		// the API is tested, but here we are making sure we reject any config change.
 		l.requestConfigChange(configurationChangeRequest{}, 100*time.Millisecond),
@@ -2109,6 +2094,29 @@ func TestRaft_LeadershipTransferLeaderReplicationTimeout(t *testing.T) {
 	}
 }
 
+func TestRaft_LeadershipTransferIgnoresNonvoters(t *testing.T) {
+	c := MakeCluster(2, t, nil)
+	defer c.Close()
+
+	follower := c.Followers()[0]
+
+	demoteFuture := c.Leader().DemoteVoter(follower.localID, 0, 0)
+	if demoteFuture.Error() != nil {
+		t.Fatalf("demote voter err'd: %v", demoteFuture.Error())
+	}
+
+	future := c.Leader().LeadershipTransfer()
+	if future.Error() == nil {
+		t.Fatal("leadership transfer should err")
+	}
+
+	expected := "cannot find peer"
+	actual := future.Error().Error()
+	if !strings.Contains(actual, expected) {
+		t.Errorf("leadership transfer should err with: %s", expected)
+	}
+}
+
 func TestRaft_LeadershipTransferStopRightAway(t *testing.T) {
 	r := Raft{leaderState: leaderState{}}
 	r.setupLeaderState()
@@ -2120,6 +2128,42 @@ func TestRaft_LeadershipTransferStopRightAway(t *testing.T) {
 	err := <-doneCh
 	if err != nil {
 		t.Errorf("leadership shouldn't have started, but instead it error with: %v", err)
+	}
+}
+func TestRaft_GetConfigurationNoBootstrap(t *testing.T) {
+	c := MakeCluster(2, t, nil)
+	defer c.Close()
+
+	// Should be one leader
+	c.Followers()
+	leader := c.Leader()
+	c.EnsureLeader(t, leader.localAddr)
+
+	// Should be able to apply
+	future := leader.Apply([]byte("test"), c.conf.CommitTimeout)
+	if err := future.Error(); err != nil {
+		c.FailNowf("[ERR] err: %v", err)
+	}
+	c.WaitForReplication(1)
+
+	// Get configuration via GetConfiguration of a running node
+	cfgf := c.rafts[0].GetConfiguration()
+	if err := cfgf.Error(); err != nil {
+		t.Fatal(err)
+	}
+	expected := cfgf.Configuration()
+
+	// Obtain the same configuration via GetConfig
+	logs := c.stores[0]
+	store := c.stores[0]
+	snap := c.snaps[0]
+	trans := c.trans[0]
+	observed, err := GetConfiguration(c.conf, c.fsms[0], logs, store, snap, trans)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(observed, expected) {
+		t.Errorf("GetConfiguration result differ from Raft.GetConfiguration: observed %+v, expected %+v", observed, expected)
 	}
 }
 
